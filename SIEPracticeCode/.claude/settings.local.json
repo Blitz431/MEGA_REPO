@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\arnie\\\\Coding\\\\SIEPracticeCode\\\\create_shortcut.ps1\")",
+      "Bash(python quiz.py)",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\arnie\\\\Coding\\\\SIEPracticeCode\\\\create_folder_shortcut.ps1\")"
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+# Personal progress data - don't commit your stats
+session_log.csv
+
+# Windows Office lock files
+~$*
+
+# Windows shortcut files (machine-specific paths)
+*.lnk
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/

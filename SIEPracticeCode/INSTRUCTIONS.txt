@@ -1,0 +1,127 @@
+SIE QUIZZER - SETUP & USAGE GUIDE
+====================================
+
+
+FIRST-TIME SETUP
+-----------------
+1. Install Python 3.9+ from https://python.org (if not already installed)
+   That's it. Everything else is handled automatically.
+
+   Optional — create a Desktop shortcut:
+      powershell -ExecutionPolicy Bypass -File create_shortcut.ps1
+
+
+LAUNCHING THE QUIZZER
+----------------------
+   Option A:  Double-click "SIE Quizzer" on the Desktop
+   Option B:  Double-click "run_quiz.bat" in this folder
+   Option C:  Open a terminal here and run:  python quiz.py
+
+
+STARTUP SCREEN
+--------------
+When you launch the quizzer it shows your progress dashboard — a table of
+every subsection showing how many questions are in the bank and your
+right / wrong counts. Then it asks you to pick a mode.
+
+
+MODES
+------
+F  Full Exam Mode
+     Simulates the real SIE exam: 75 questions drawn from all four
+     sections using the official exam distribution:
+       Section 1 (Knowledge of Capital Markets)          12 questions
+       Section 2 (Understanding Products & Their Risks)  33 questions
+       Section 3 (Trading, Accounts & Prohibited Acts)   23 questions
+       Section 4 (Regulatory Framework)                   7 questions
+     After finishing you see a section-by-section breakdown and a
+     PASS / FAIL indicator (passing is 72%).
+
+S  Study Mode
+     Choose exactly which subsections to study.
+     1. Pick a main section (1-4) or "A" for all sections.
+     2. Toggle individual subsections on/off in the checklist.
+     3. Set a target question count.
+        - If the bank is short, the quizzer auto-fills from other
+          subsections in the SAME main section (never crosses sections).
+        - If the bank has more than you need, it randomly samples down.
+     Adaptive learning is ON by default (type A to toggle it off).
+
+W  Weak Areas Mode
+     Shows only the questions you have answered incorrectly before
+     (WRONG > 0). Great for targeted review before exam day.
+
+
+ADAPTIVE LEARNING
+------------------
+When adaptive learning is ON (the default in Study Mode and always in
+Full Exam Mode), questions you have answered wrong more often get a
+higher chance of appearing. Questions you consistently get right are
+shown less. This focuses your practice where you need it most.
+
+You can toggle adaptive learning ON/OFF at the target-count prompt
+by typing A.
+
+
+MENUS & NAVIGATION
+-------------------
+Checklist menus:
+   <number>   toggle that item on/off
+   A          select all
+   C          clear all
+   Enter      confirm your selection
+
+Question answering:
+   1 / 2 / 3 / 4   pick your answer (choices are shuffled every time)
+
+Anywhere:
+   H or ?   show the in-app help screen
+   Q        go back / return to main menu
+   Ctrl+C   exit the program immediately
+
+
+TRACKING & STATS
+-----------------
+After every answer the quizzer updates three columns in
+"QUESTION BANK AND TRACKER.xlsx":
+   # Of times asked   incremented by 1
+   RIGHT              incremented if your answer was correct
+   WRONG              incremented if your answer was wrong
+
+A session summary is also appended to "session_log.csv" so you can
+track your improvement over time.
+
+IMPORTANT: Close Excel before running the quizzer, otherwise the
+quizzer cannot write your stats back to the file.
+
+
+ADDING QUESTIONS
+-----------------
+Open "QUESTION BANK AND TRACKER.xlsx" and add rows in this format:
+
+   Col A (Section)         Subsection code, e.g.  2.2
+   Col B (Question)        Full question text
+   Col C (A)               Answer choice A
+   Col D (B)               Answer choice B
+   Col E (C)               Answer choice C
+   Col F (D)               Answer choice D
+   Col G (Correct Answer)  The correct letter: A, B, C, or D
+   Col H (# Of times asked) Start at 0
+   Col I (RIGHT)            Start at 0
+   Col J (WRONG)            Start at 0
+
+Section codes follow this structure:
+   1.1  Regulatory Entities, Agencies & Market Participants
+   1.2  Market Structure
+   1.3  Economic Factors
+   2.1  Equity Securities
+   2.2  Debt Securities
+   2.3  Packaged Products
+   2.4  Options
+   2.5  Alternative Investments & Other Products
+   3.1  Trading Securities
+   3.2  Customer Accounts & Compliance
+   3.3  Prohibited Activities
+   4.1  SROs and Regulatory Bodies
+   4.2  Registration & Licensing
+   4.3  Key Regulations & Rules
