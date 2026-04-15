@@ -10,8 +10,11 @@ Usage:  python quiz.py
 import os
 import sys
 import csv
+import json
+import time
 import random
 import datetime
+import subprocess
 
 try:
     import openpyxl
@@ -23,10 +26,12 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "QUESTION BANK AND TRACKER.xlsx")
-LOG_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "session_log.csv")
+EXCEL_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "QUESTION BANK AND TRACKER.xlsx")
+LOG_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "session_log.csv")
+BOOKMARKS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "bookmarks.json")
 
 SECTION_MAP = {
     "1": {
@@ -89,6 +94,8 @@ HELP_TEXT = """
 ║  F  Full Exam    75 questions, real SIE distribution        ║
 ║  S  Study Mode   pick sections/subsections + target count   ║
 ║  W  Weak Areas   only questions you've answered wrong       ║
+║  B  Bookmarks    re-quiz your bookmarked questions          ║
+║  V  View History show your past session scores              ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  CHECKLIST MENUS                                            ║
 ║  <number>  toggle that item on/off                          ║
@@ -98,6 +105,9 @@ HELP_TEXT = """
 ╠══════════════════════════════════════════════════════════════╣
 ║  ANSWERING QUESTIONS                                        ║
 ║  1–4       pick your answer (choices are shuffled each time)║
+║  IDK       skip — marks wrong, adds to review list          ║
+║  C         copy question + answer to clipboard              ║
+║  B         bookmark this question for later review          ║
 ║  H or ?    show this help screen                            ║
 ║  Q         quit to main menu                                ║
 ║  Ctrl+C    exit the program                                 ║
@@ -105,6 +115,7 @@ HELP_TEXT = """
 ║  TRACKING                                                   ║
 ║  RIGHT / WRONG / # times asked are saved to Excel after     ║
 ║  each answer. Close Excel before running to allow saving.   ║
+║  Column K in Excel = explanation text (fill in anytime).    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -134,10 +145,13 @@ def load_all_questions() -> list:
         section_raw, question, choice_a, choice_b, choice_c, choice_d, \
             correct, times, right, wrong = (row[i] for i in range(10))
 
+        # Column K (index 10): optional explanation — user can fill this in anytime
+        explanation = str(row[10]).strip() if len(row) > 10 and row[10] is not None else ""
+
         if section_raw is None:
             continue
 
-        # Normalize section to "X.X" string (it is stored as a float)
+        # Normalize section to "X.X" string (it may be stored as a float)
         try:
             section_str = f"{float(section_raw):.1f}"
         except (ValueError, TypeError):
@@ -154,19 +168,20 @@ def load_all_questions() -> list:
             continue
 
         questions.append({
-            "row":        row_idx,
-            "section":    section_str,
-            "question":   str(question),
-            "choices":    {
+            "row":         row_idx,
+            "section":     section_str,
+            "question":    str(question),
+            "choices":     {
                 "A": str(choice_a),
                 "B": str(choice_b),
                 "C": str(choice_c),
                 "D": str(choice_d),
             },
-            "correct":    correct,
-            "times_asked": int(times)  if times  is not None else 0,
-            "right":       int(right)  if right   is not None else 0,
-            "wrong":       int(wrong)  if wrong   is not None else 0,
+            "correct":     correct,
+            "explanation": explanation,
+            "times_asked": int(times) if times is not None else 0,
+            "right":       int(right) if right  is not None else 0,
+            "wrong":       int(wrong) if wrong  is not None else 0,
         })
 
     wb.close()
@@ -192,7 +207,7 @@ def save_result(row: int, correct: bool) -> None:
         wb.save(EXCEL_PATH)
         wb.close()
     except PermissionError:
-        print("\n  [Warning] Could not save to Excel — close the file in Excel and re-run to save stats.")
+        print("\n  [Warning] Could not save to Excel — close the file and re-run to save stats.")
     except Exception as exc:
         print(f"\n  [Warning] Could not save result: {exc}")
 
@@ -216,6 +231,26 @@ def append_session_log(mode: str, sections: str, target: int,
     except Exception:
         pass  # Don't crash if log write fails
 
+
+def load_bookmarks() -> set:
+    """Load bookmarked row numbers from bookmarks.json."""
+    if not os.path.exists(BOOKMARKS_PATH):
+        return set()
+    try:
+        with open(BOOKMARKS_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_bookmarks(bookmarks: set) -> None:
+    """Save bookmarked row numbers to bookmarks.json."""
+    try:
+        with open(BOOKMARKS_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(bookmarks), f)
+    except Exception as exc:
+        print(f"  [Warning] Could not save bookmarks: {exc}")
+
 # ---------------------------------------------------------------------------
 # Adaptive weighting
 # ---------------------------------------------------------------------------
@@ -232,13 +267,12 @@ def question_weight(q: dict) -> float:
 
 
 def weighted_sample(pool: list, k: int) -> list:
-    """Sample k items from pool using adaptive weights (with replacement de-duped)."""
+    """Sample k items from pool using adaptive weights (without replacement)."""
     if k >= len(pool):
         result = pool[:]
         random.shuffle(result)
         return result
     weights = [question_weight(q) for q in pool]
-    # Sample without replacement by drawing one at a time
     selected = []
     remaining = list(zip(pool, weights))
     for _ in range(k):
@@ -256,12 +290,10 @@ def weighted_sample(pool: list, k: int) -> list:
 
 def show_dashboard(all_questions: list) -> None:
     """Print a progress table grouped by subsection."""
-    # Collect all known subsections in canonical order
     ordered_subs = []
     for sk in sorted(SECTION_MAP.keys()):
         ordered_subs.extend(SECTION_MAP[sk]["subsections"])
 
-    # Group questions by subsection
     by_sub = {s: [] for s in ordered_subs}
     for q in all_questions:
         if q["section"] in by_sub:
@@ -275,13 +307,13 @@ def show_dashboard(all_questions: list) -> None:
 
     for sk in sorted(SECTION_MAP.keys()):
         for sub in SECTION_MAP[sk]["subsections"]:
-            qs     = by_sub.get(sub, [])
-            total  = len(qs)
-            right  = sum(q["right"]  for q in qs)
-            wrong  = sum(q["wrong"]  for q in qs)
-            asked  = right + wrong
-            pct    = f"{right/asked*100:.0f}%" if asked > 0 else "—"
-            name   = SECTION_MAP[sk]["sub_names"].get(sub, "")
+            qs    = by_sub.get(sub, [])
+            total = len(qs)
+            right = sum(q["right"] for q in qs)
+            wrong = sum(q["wrong"] for q in qs)
+            asked = right + wrong
+            pct   = f"{right/asked*100:.0f}%" if asked > 0 else "—"
+            name  = SECTION_MAP[sk]["sub_names"].get(sub, "")
             print(f"  {sub:<8} {name:<42} {total:>4} {right:>5} {wrong:>5} {pct:>6}")
 
     print(THIN_DIV)
@@ -323,7 +355,6 @@ def reset_data() -> None:
         print("  Cancelled.")
         return
 
-    # Reset Excel tracking columns
     print("  Resetting Excel stats...", flush=True)
     try:
         wb = openpyxl.load_workbook(EXCEL_PATH)
@@ -344,7 +375,6 @@ def reset_data() -> None:
         print(f"  ERROR resetting Excel: {exc}")
         return
 
-    # Delete session log
     if os.path.exists(LOG_PATH):
         try:
             os.remove(LOG_PATH)
@@ -359,7 +389,7 @@ def reset_data() -> None:
 
 
 def choose_mode() -> str:
-    """Return 'F', 'S', or 'W'."""
+    """Return mode code: F, S, W, B, V, or R."""
     while True:
         print(f"\n{DIVIDER}")
         print("  SELECT MODE")
@@ -367,16 +397,18 @@ def choose_mode() -> str:
         print("  F  Full Exam Mode  (75 q, real SIE distribution)")
         print("  S  Study Mode      (choose sections + target count)")
         print("  W  Weak Areas      (questions you've gotten wrong)")
+        print("  B  Bookmarks       (questions you've bookmarked)")
+        print("  V  View History    (past session scores)")
         print("  R  Reset Data      (clear all stats and logs)")
         print("  H  Help            Q  Quit")
         print(THIN_DIV)
         choice = _input("  Your choice: ")
-        if choice in ("F", "S", "W", "R"):
+        if choice in ("F", "S", "W", "B", "V", "R"):
             return choice
         if choice == "Q":
             raise SystemExit
         if choice not in ("H", "?"):
-            print("  Invalid — please enter F, S, W, or R.")
+            print("  Invalid — please enter F, S, W, B, V, or R.")
 
 
 def choose_main_section() -> str:
@@ -417,7 +449,6 @@ def checklist_menu(items: list, counts: dict, title: str) -> list:
         for i, item in enumerate(items, 1):
             mark  = "X" if item in selected else " "
             count = counts.get(item, 0)
-            # Try to get a friendly name
             name  = ""
             for sk, sv in SECTION_MAP.items():
                 if item in sv["sub_names"]:
@@ -505,14 +536,12 @@ def gather_study_questions(all_questions: list, selected_subs: list,
     pool = filter_by_subsections(all_questions, selected_subs)
 
     if len(pool) < target and section_key != "ALL":
-        # Pull from other subsections in the same main section
-        all_subs = SECTION_MAP[section_key]["subsections"]
+        all_subs  = SECTION_MAP[section_key]["subsections"]
         neighbors = [s for s in all_subs if s not in selected_subs]
         for neighbor in neighbors:
             if len(pool) >= target:
                 break
-            extra = filter_by_subsections(all_questions, [neighbor])
-            pool += extra
+            pool += filter_by_subsections(all_questions, [neighbor])
         if len(pool) < target:
             print(f"\n  [Note] Only {len(pool)} questions available in Section {section_key} — using all of them.")
 
@@ -535,49 +564,96 @@ def gather_exam_questions(all_questions: list, adaptive: bool) -> list:
             continue
         if len(pool) < count:
             print(f"  [Note] Section {sk} only has {len(pool)} questions (need {count}) — using all available.")
-
         if adaptive:
             sampled = weighted_sample(pool, count)
         else:
             sampled = pool[:] if count >= len(pool) else random.sample(pool, count)
-
         result.extend(sampled)
 
     random.shuffle(result)
     return result
 
+
+def missed_to_questions(missed_questions: list) -> list:
+    """Convert missed_questions entries back to question dicts for re-quizzing."""
+    return [{
+        "row":         mq["row"],
+        "section":     mq["section"],
+        "question":    mq["question"],
+        "choices":     mq["choices"],
+        "correct":     mq["correct"],
+        "explanation": mq.get("explanation", ""),
+        "times_asked": 0,
+        "right":       0,
+        "wrong":       0,
+    } for mq in missed_questions]
+
 # ---------------------------------------------------------------------------
 # Quiz engine
 # ---------------------------------------------------------------------------
 
-def run_quiz(questions: list) -> tuple:
+def _copy_to_clipboard(q: dict) -> None:
+    """Copy question + all answer choices (A–D order) + correct marker to clipboard."""
+    sec_key  = q["section"].split(".")[0]
+    sub_name = SECTION_MAP.get(sec_key, {}).get("sub_names", {}).get(q["section"], q["section"])
+    lines = [f"[SIE Section {q['section']} — {sub_name}]", "", f"Q: {q['question']}", ""]
+    for letter in ["A", "B", "C", "D"]:
+        marker = "  <- CORRECT" if letter == q["correct"] else ""
+        lines.append(f"  {letter}. {q['choices'][letter]}{marker}")
+    if q.get("explanation"):
+        lines += ["", f"  Explanation: {q['explanation']}"]
+    text = "\n".join(lines)
+    try:
+        subprocess.run("clip", input=text.encode("utf-8"), check=True, shell=True)
+        print("  Copied to clipboard! Paste into Claude to get help.")
+    except Exception:
+        print("  (Could not copy to clipboard — try again.)")
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as Xm Ys."""
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
+
+
+def _wrap(text: str, width: int = 60, indent: str = "  ") -> list:
+    """Word-wrap text to width, returning list of indented lines."""
+    words = text.split()
+    line, lines = "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            lines.append(indent + line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        lines.append(indent + line)
+    return lines
+
+
+def run_quiz(questions: list, bookmarks: set = None) -> tuple:
     """
-    Run the quiz loop. Returns (correct_count, total, section_results).
-    section_results: dict mapping main section key -> (correct, total)
+    Run the quiz loop.
+    Returns (correct_count, total, section_results, missed_questions, elapsed_seconds).
+
+    missed_questions entries include wrong answers, IDK, and lucky guesses
+    (correct answers where confidence == 1).
     """
-    correct_count = 0
-    total         = len(questions)
-    # Track per-section for Full Exam breakdown
-    section_results = {}  # "1" -> [correct, total]
+    correct_count    = 0
+    total            = len(questions)
+    section_results  = {}
+    missed_questions = []
+    session_start    = time.time()
 
     for i, q in enumerate(questions, 1):
         print(f"\n{DIVIDER}")
-        print(f"  Question {i} of {total}   |   Section {q['section']}")
+        bm_tag = "  [BOOKMARKED]" if (bookmarks is not None and q["row"] in bookmarks) else ""
+        print(f"  Question {i} of {total}   |   Section {q['section']}{bm_tag}")
         print(DIVIDER)
 
-        # Wrap long question text at ~60 chars
-        words = q["question"].split()
-        line, lines = "", []
-        for w in words:
-            if len(line) + len(w) + 1 > 60:
-                lines.append(line)
-                line = w
-            else:
-                line = (line + " " + w).strip()
-        if line:
-            lines.append(line)
-        for ln in lines:
-            print(f"  {ln}")
+        for ln in _wrap(q["question"]):
+            print(ln)
         print()
 
         # Shuffle answer choices
@@ -589,31 +665,77 @@ def run_quiz(questions: list) -> tuple:
             print(f"    {num}. {q['choices'][letter]}")
         print()
 
-        # Get answer
-        answer = None
-        while answer is None:
-            raw = _input("  Your answer (1–4, H=help, Q=quit): ")
-            if raw == "Q":
-                print("\n  Returning to main menu...")
-                # Save partial progress
-                return correct_count, i - 1, section_results
-            if raw in ("1", "2", "3", "4"):
-                answer = raw
-            elif raw not in ("H", "?"):
-                print("  Invalid — enter 1, 2, 3, or 4.")
-
-        chosen_letter  = mapping[answer]
-        is_correct     = (chosen_letter == q["correct"])
         correct_letter = q["correct"]
         correct_text   = q["choices"][correct_letter]
 
-        if is_correct:
-            correct_count += 1
-            print(f"\n  CORRECT!  {correct_text}")
+        # --- Get answer ---
+        answer  = None
+        was_idk = False
+        while answer is None:
+            raw = _input("  Your answer (1–4, IDK=skip, C=copy, B=bookmark, H=help, Q=quit): ")
+            if raw == "Q":
+                print("\n  Returning to main menu...")
+                return correct_count, i - 1, section_results, missed_questions, time.time() - session_start
+            if raw == "IDK":
+                answer  = "IDK"
+                was_idk = True
+            elif raw == "C":
+                _copy_to_clipboard(q)
+            elif raw == "B":
+                if bookmarks is not None:
+                    if q["row"] in bookmarks:
+                        bookmarks.discard(q["row"])
+                        save_bookmarks(bookmarks)
+                        print("  Bookmark removed.")
+                    else:
+                        bookmarks.add(q["row"])
+                        save_bookmarks(bookmarks)
+                        print("  Bookmarked!")
+                else:
+                    print("  (Bookmarks not available in this session.)")
+            elif raw in ("1", "2", "3", "4"):
+                answer = raw
+            elif raw not in ("H", "?"):
+                print("  Invalid — enter 1–4, IDK, C, B, H, or Q.")
+
+        # --- Evaluate answer ---
+        if was_idk:
+            is_correct = False
+            print(f"\n  Skipped — correct answer:  {correct_text}")
         else:
-            chosen_text = q["choices"][chosen_letter]
-            print(f"\n  INCORRECT.  You chose:     {chosen_text}")
-            print(f"  Correct answer:  {correct_text}")
+            chosen_letter = mapping[answer]
+            is_correct    = (chosen_letter == correct_letter)
+            if is_correct:
+                correct_count += 1
+                print(f"\n  CORRECT!  {correct_text}")
+            else:
+                chosen_text = q["choices"][chosen_letter]
+                print(f"\n  INCORRECT.  You chose:     {chosen_text}")
+                print(f"  Correct answer:  {correct_text}")
+
+        # Show explanation if available (wrong / IDK only)
+        if not is_correct and q.get("explanation"):
+            print(f"\n  WHY: {q['explanation']}")
+
+        # --- Confidence rating ---
+        conf_raw = input("  Confidence? (1=guessed  2=unsure  3=sure  Enter=skip): ").strip()
+        confidence = int(conf_raw) if conf_raw in ("1", "2", "3") else None
+
+        # Track missed: wrong, IDK, or correct-but-guessed (lucky guess)
+        was_lucky = is_correct and confidence == 1
+        if not is_correct or was_lucky:
+            missed_questions.append({
+                "row":          q["row"],
+                "section":      q["section"],
+                "question":     q["question"],
+                "choices":      q["choices"],
+                "correct":      correct_letter,
+                "correct_text": correct_text,
+                "explanation":  q.get("explanation", ""),
+                "was_idk":      was_idk,
+                "was_lucky":    was_lucky,
+                "confidence":   confidence,
+            })
 
         # Track per-section
         sec_key = q["section"].split(".")[0]
@@ -627,12 +749,13 @@ def run_quiz(questions: list) -> tuple:
         save_result(q["row"], is_correct)
         print(THIN_DIV)
 
-    return correct_count, total, section_results
+    return correct_count, total, section_results, missed_questions, time.time() - session_start
 
 
 def show_score(correct: int, total: int,
-               section_results: dict = None, exam_mode: bool = False) -> None:
-    """Print final score. Optionally show per-section breakdown for exam mode."""
+               section_results: dict = None, exam_mode: bool = False,
+               missed_questions: list = None, elapsed: float = None) -> None:
+    """Print final score, timing, and WHAT TO STUDY block."""
     print(f"\n{DIVIDER}")
     print("  RESULTS")
     print(DIVIDER)
@@ -643,6 +766,12 @@ def show_score(correct: int, total: int,
         return
 
     pct = correct / total * 100
+
+    # Timing
+    if elapsed is not None and elapsed > 0:
+        avg_per_q = elapsed / total
+        print(f"  Time: {_fmt_elapsed(elapsed)}   (avg {avg_per_q:.1f}s / question)")
+        print(THIN_DIV)
 
     if exam_mode and section_results:
         for sk in sorted(SECTION_MAP.keys()):
@@ -661,8 +790,88 @@ def show_score(correct: int, total: int,
 
     print(DIVIDER)
 
+    # WHAT TO STUDY block
+    if missed_questions:
+        print(f"\n{DIVIDER}")
+        print(f"  WHAT TO STUDY  ({len(missed_questions)} question(s) to review)")
+        print(DIVIDER)
+
+        by_section: dict = {}
+        for mq in missed_questions:
+            by_section.setdefault(mq["section"], []).append(mq)
+
+        for sec in sorted(by_section.keys()):
+            sec_key  = sec.split(".")[0]
+            sub_name = SECTION_MAP.get(sec_key, {}).get("sub_names", {}).get(sec, sec)
+            print(f"\n  [Section {sec} — {sub_name}]")
+            for mq in by_section[sec]:
+                if mq.get("was_lucky"):
+                    tag = "  (Lucky Guess)"
+                elif mq["was_idk"]:
+                    tag = "  (IDK)"
+                else:
+                    tag = "  (Wrong)"
+                for ln in _wrap(mq["question"], width=56):
+                    prefix = f"  Q{tag}:" if ln == _wrap(mq["question"], width=56)[0] else "         "
+                    print(f"{prefix} {ln.strip()}")
+                print(f"  A: {mq['correct_text']}")
+                if mq.get("explanation"):
+                    print(f"  WHY: {mq['explanation']}")
+                print(THIN_DIV)
+
+        print()
+
+
+def show_history() -> None:
+    """Display past session scores from session_log.csv."""
+    print(f"\n{DIVIDER}")
+    print("  SESSION HISTORY")
+    print(DIVIDER)
+
+    if not os.path.exists(LOG_PATH):
+        print("  No session history yet — complete a quiz to start tracking.")
+        print(DIVIDER)
+        return
+
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as exc:
+        print(f"  Could not read session log: {exc}")
+        print(DIVIDER)
+        return
+
+    if not rows:
+        print("  No sessions recorded yet.")
+        print(DIVIDER)
+        return
+
+    recent = rows[-20:]
+    print(f"  {'#':<4} {'Date':<12} {'Mode':<12} {'Score':<10} {'%':>6}")
+    print(THIN_DIV)
+    for i, r in enumerate(recent, 1):
+        try:
+            score = f"{r['correct']}/{r['total']}"
+            pct   = f"{float(r['pct']):.1f}%"
+            mode  = r.get("mode", "?")[:11]
+            date  = r.get("date", "?")
+            print(f"  {i:<4} {date:<12} {mode:<12} {score:<10} {pct:>6}")
+        except (KeyError, ValueError):
+            continue
+
+    if len(rows) >= 2:
+        last5 = rows[-5:]
+        try:
+            avg = sum(float(r["pct"]) for r in last5) / len(last5)
+            print(THIN_DIV)
+            print(f"  Last {len(last5)}-session avg: {avg:.1f}%")
+        except (KeyError, ValueError):
+            pass
+
+    print(DIVIDER)
+
 # ---------------------------------------------------------------------------
-# Session log
+# Session log helpers
 # ---------------------------------------------------------------------------
 
 def _sections_label(mode: str, selected_subs: list) -> str:
@@ -686,24 +895,28 @@ def main() -> None:
     print("  Type H at any prompt for help.")
     print(DIVIDER)
 
-    # Load question bank once
     print("  Loading question bank...", flush=True)
     all_questions = load_all_questions()
     if not all_questions:
         print("\n  No questions found in the Excel file. Add questions and re-run.")
         sys.exit(0)
 
-    # Show progress dashboard
+    bookmarks = load_bookmarks()
     show_dashboard(all_questions)
 
-    adaptive_default = True  # adaptive learning on by default
+    adaptive_default = True
 
     try:
         while True:
             mode = choose_mode()
-            selected_subs = []
+            missed = []
 
-            # Reset — clear stats then reload so dashboard shows zeroed counts
+            # --- View History ---
+            if mode == "V":
+                show_history()
+                continue
+
+            # --- Reset ---
             if mode == "R":
                 reset_data()
                 all_questions = load_all_questions()
@@ -718,9 +931,31 @@ def main() -> None:
                     print("  No questions available for Full Exam Mode. Add questions and re-run.")
                     continue
                 print(f"  {len(questions)} questions loaded. Good luck!\n")
-                correct, total, section_results = run_quiz(questions)
-                show_score(correct, total, section_results, exam_mode=True)
-                append_session_log("Full Exam", "All", 75, correct, total)
+                correct, total_q, section_results, missed, elapsed = run_quiz(questions, bookmarks)
+                show_score(correct, total_q, section_results, exam_mode=True,
+                           missed_questions=missed, elapsed=elapsed)
+                append_session_log("Full Exam", "All", 75, correct, total_q)
+
+            # --- Bookmarks Mode ---
+            elif mode == "B":
+                bq = [q for q in all_questions if q["row"] in bookmarks]
+                if not bq:
+                    print("\n  No bookmarks yet — press B during a quiz to bookmark a question.")
+                    continue
+                print(f"\n  {len(bq)} bookmarked question(s) loaded.")
+                random.shuffle(bq)
+                correct, total_q, section_results, missed, elapsed = run_quiz(bq, bookmarks)
+                show_score(correct, total_q, missed_questions=missed, elapsed=elapsed)
+                # Offer to remove correctly-answered bookmarks
+                missed_rows    = {mq["row"] for mq in missed}
+                got_right_rows = {q["row"] for q in bq[:total_q]} - missed_rows
+                if got_right_rows:
+                    clear = _input(f"  Remove {len(got_right_rows)} correctly-answered bookmark(s)? (Y/N): ")
+                    if clear == "Y":
+                        bookmarks -= got_right_rows
+                        save_bookmarks(bookmarks)
+                        print(f"  {len(got_right_rows)} bookmark(s) removed.")
+                append_session_log("Bookmarks", "Bookmarks", len(bq), correct, total_q)
 
             # --- Weak Areas Mode ---
             elif mode == "W":
@@ -732,9 +967,9 @@ def main() -> None:
                 target, _ = get_target_count(len(weak), adaptive_default)
                 sampled = random.sample(weak, min(target, len(weak)))
                 random.shuffle(sampled)
-                correct, total, section_results = run_quiz(sampled)
-                show_score(correct, total)
-                append_session_log("Weak Areas", "Weak", target, correct, total)
+                correct, total_q, section_results, missed, elapsed = run_quiz(sampled, bookmarks)
+                show_score(correct, total_q, missed_questions=missed, elapsed=elapsed)
+                append_session_log("Weak Areas", "Weak", target, correct, total_q)
 
             # --- Study Mode ---
             else:
@@ -746,31 +981,26 @@ def main() -> None:
                     all_subs = []
                     for sv in SECTION_MAP.values():
                         all_subs.extend(sv["subsections"])
-                    counts = {}
-                    for sub in all_subs:
-                        counts[sub] = sum(1 for q in all_questions if q["section"] == sub)
+                    counts = {sub: sum(1 for q in all_questions if q["section"] == sub)
+                              for sub in all_subs}
                     selected_subs = checklist_menu(all_subs, counts, "SELECT SUBSECTIONS (All Sections)")
                     effective_section = "ALL"
                 else:
-                    subs = SECTION_MAP[sec_key]["subsections"]
-                    counts = {}
-                    for sub in subs:
-                        counts[sub] = sum(1 for q in all_questions if q["section"] == sub)
-                    section_title = f"SELECT SUBSECTIONS — Section {sec_key}"
-                    selected_subs = checklist_menu(subs, counts, section_title)
+                    subs   = SECTION_MAP[sec_key]["subsections"]
+                    counts = {sub: sum(1 for q in all_questions if q["section"] == sub)
+                              for sub in subs}
+                    selected_subs = checklist_menu(subs, counts,
+                                                   f"SELECT SUBSECTIONS — Section {sec_key}")
                     effective_section = sec_key
 
                 if not selected_subs:
                     continue
 
                 pool_size = len(filter_by_subsections(all_questions, selected_subs))
-                # Include neighbors in the available count hint
                 if effective_section != "ALL":
-                    all_sec_subs = SECTION_MAP[effective_section]["subsections"]
-                    total_in_section = sum(
-                        1 for q in all_questions
-                        if q["section"] in all_sec_subs
-                    )
+                    all_sec_subs     = SECTION_MAP[effective_section]["subsections"]
+                    total_in_section = sum(1 for q in all_questions
+                                          if q["section"] in all_sec_subs)
                     if total_in_section > pool_size:
                         print(f"\n  ({total_in_section - pool_size} more questions available from "
                               f"other subsections in Section {effective_section} for auto-fill)")
@@ -780,17 +1010,25 @@ def main() -> None:
                     all_questions, selected_subs, effective_section,
                     target, adaptive_default
                 )
-
                 if not questions:
                     print("  No questions found for that selection. Try a different section.")
                     continue
 
-                correct, total, section_results = run_quiz(questions)
-                show_score(correct, total)
+                correct, total_q, section_results, missed, elapsed = run_quiz(questions, bookmarks)
+                show_score(correct, total_q, missed_questions=missed, elapsed=elapsed)
                 append_session_log(
                     "Study", _sections_label(mode, selected_subs),
-                    target, correct, total
+                    target, correct, total_q
                 )
+
+            # --- Re-quiz missed questions ---
+            if missed:
+                rq = _input(f"  Re-quiz {len(missed)} missed question(s)? (Y/N): ")
+                if rq == "Y":
+                    rq_questions = missed_to_questions(missed)
+                    random.shuffle(rq_questions)
+                    rq_correct, rq_total, rq_sec, rq_missed, rq_elapsed = run_quiz(rq_questions, bookmarks)
+                    show_score(rq_correct, rq_total, missed_questions=rq_missed, elapsed=rq_elapsed)
 
             # Continue prompt
             print()
@@ -798,7 +1036,7 @@ def main() -> None:
             if again != "Y":
                 break
 
-            # Reload questions so updated stats are reflected in next session
+            # Reload so updated stats are reflected in next session
             all_questions = load_all_questions()
             show_dashboard(all_questions)
 
