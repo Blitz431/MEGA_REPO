@@ -3,7 +3,13 @@
     "allow": [
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\arnie\\\\Coding\\\\SIEPracticeCode\\\\create_shortcut.ps1\")",
       "Bash(python quiz.py)",
-      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\arnie\\\\Coding\\\\SIEPracticeCode\\\\create_folder_shortcut.ps1\")"
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\arnie\\\\Coding\\\\SIEPracticeCode\\\\create_folder_shortcut.ps1\")",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(python web_app.py)",
+      "Bash(curl -s http://localhost:5000/api/dashboard)",
+      "Bash(curl -s http://localhost:5000/)",
+      "Bash(python -m json.tool --no-ensure-ascii)"
     ]
   }
 }

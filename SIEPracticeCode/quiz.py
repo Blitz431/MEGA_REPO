@@ -38,7 +38,7 @@ SECTION_MAP = {
         "name": "Knowledge of Capital Markets",
         "subsections": ["1.1", "1.2", "1.3"],
         "sub_names": {
-            "1.1": "Regulatory Entities, Agencies & Market Participants",
+            "1.1": "Regulatory, Agencies, & Market",
             "1.2": "Market Structure",
             "1.3": "Economic Factors",
         },
@@ -51,7 +51,7 @@ SECTION_MAP = {
             "2.2": "Debt Securities",
             "2.3": "Packaged Products",
             "2.4": "Options",
-            "2.5": "Alternative Investments & Other Products",
+            "2.5": "Alt Investments & Other Products",
         },
     },
     "3": {
@@ -107,10 +107,19 @@ HELP_TEXT = """
 ║  1–4       pick your answer (choices are shuffled each time)║
 ║  IDK       skip — marks wrong, adds to review list          ║
 ║  C         copy question + answer to clipboard              ║
-║  B         bookmark this question for later review          ║
+║  B         bookmark (in Exam Mode, type B at answer prompt) ║
+║  END TEST  end Full Exam early and go straight to review    ║
 ║  H or ?    show this help screen                            ║
 ║  Q         quit to main menu                                ║
 ║  Ctrl+C    exit the program                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  CONFIDENCE (shown after correct answers in study modes)    ║
+║  1  Guessed    — shown again like a wrong answer (penalized)║
+║  2  Unsure     — shown more often than average              ║
+║  3  Kinda sure — shown at normal frequency                  ║
+║  4  Sure       — shown less often (you know it cold)        ║
+║  Enter         — skip, treated the same as kinda sure (3)   ║
+║  Add ,B to combine rating + bookmark  (e.g.  3,B  or  B,2) ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  TRACKING                                                   ║
 ║  RIGHT / WRONG / # times asked are saved to Excel after     ║
@@ -147,6 +156,10 @@ def load_all_questions() -> list:
 
         # Column K (index 10): optional explanation — user can fill this in anytime
         explanation = str(row[10]).strip() if len(row) > 10 and row[10] is not None else ""
+        # Column L (index 11): lucky guesses
+        lucky = int(row[11]) if len(row) > 11 and row[11] is not None else 0
+        # Column M (index 12): cumulative confidence points (2=kinda sure baseline per right answer)
+        conf_sum = int(row[12]) if len(row) > 12 and row[12] is not None else 0
 
         if section_raw is None:
             continue
@@ -182,13 +195,15 @@ def load_all_questions() -> list:
             "times_asked": int(times) if times is not None else 0,
             "right":       int(right) if right  is not None else 0,
             "wrong":       int(wrong) if wrong  is not None else 0,
+            "lucky":       lucky,
+            "conf_sum":    conf_sum,
         })
 
     wb.close()
     return questions
 
 
-def save_result(row: int, correct: bool) -> None:
+def save_result(row: int, correct: bool, lucky: bool = False, conf_pts: int = 0) -> None:
     """Increment tracking columns in the Excel file for the given row."""
     try:
         wb = openpyxl.load_workbook(EXCEL_PATH)
@@ -198,11 +213,24 @@ def save_result(row: int, correct: bool) -> None:
             v = ws.cell(row=row, column=col).value
             ws.cell(row=row, column=col).value = (int(v) if v is not None else 0) + 1
 
+        def add(col, n):
+            v = ws.cell(row=row, column=col).value
+            ws.cell(row=row, column=col).value = (int(v) if v is not None else 0) + n
+
+        if ws.cell(row=1, column=12).value is None:
+            ws.cell(row=1, column=12).value = "LUCKY"
+        if ws.cell(row=1, column=13).value is None:
+            ws.cell(row=1, column=13).value = "CONF_SUM"
+
         inc(8)  # # Of times asked
         if correct:
             inc(9)   # RIGHT
         else:
             inc(10)  # WRONG
+        if lucky:
+            inc(12)  # LUCKY
+        if conf_pts > 0:
+            add(13, conf_pts)  # CONF_SUM
 
         wb.save(EXCEL_PATH)
         wb.close()
@@ -256,14 +284,34 @@ def save_bookmarks(bookmarks: set) -> None:
 # ---------------------------------------------------------------------------
 
 def question_weight(q: dict) -> float:
-    """Higher weight = shown more often (weak questions prioritized)."""
-    wrong = q["wrong"]
-    right = q["right"]
-    total = wrong + right
+    """Higher weight = shown more often (weak questions prioritized).
+
+    Confidence ratings accumulate in conf_sum (2 pts = kinda-sure baseline):
+      rating 1 (guessed)   → 0 pts, also counted as wrong via lucky flag
+      rating 2 (unsure)    → 1 pt  → conf_ratio 0.5 → weight ~1.25 at 100% acc
+      rating 3 (kinda sure)→ 2 pts → conf_ratio 1.0 → weight ~0.50 at 100% acc
+      rating 4 (sure)      → 3 pts → conf_ratio 1.5 → weight ~0.30 at 100% acc
+      no rating / exam mode→ 2 pts → same as kinda sure
+    """
+    lucky      = q.get("lucky", 0)
+    conf_sum   = q.get("conf_sum", 0)
+    wrong      = q["wrong"] + lucky
+    real_right = max(0, q["right"] - lucky)
+    total      = wrong + real_right
     if total == 0:
-        return 2.0  # unasked questions get medium-high priority
-    accuracy = right / total
-    return max(0.5, 2.0 - accuracy * 1.5)
+        return 2.0
+
+    base_accuracy = real_right / total
+
+    # conf_ratio: how confident are the correct answers on average?
+    # 1.0 = kinda sure (baseline), <1 = less confident, >1 = more confident
+    if real_right > 0 and conf_sum > 0:
+        conf_ratio = conf_sum / (real_right * 2)
+    else:
+        conf_ratio = 1.0  # backward-compatible: unrated answers treated as kinda sure
+
+    effective_accuracy = base_accuracy * conf_ratio
+    return max(0.3, 2.0 - effective_accuracy * 1.5)
 
 
 def weighted_sample(pool: list, k: int) -> list:
@@ -302,27 +350,35 @@ def show_dashboard(all_questions: list) -> None:
     print(f"\n{DIVIDER}")
     print("  YOUR PROGRESS")
     print(DIVIDER)
-    print(f"  {'Section':<8} {'Topic':<42} {'Q':>4} {'Right':>5} {'Wrong':>5} {'%':>6}")
+    print(f"  {'Section':<8} {'Topic':<38} {'Q':>4} {'Right':>5} {'Wrong':>5} {'Lucky':>5} {'Conf':>5} {'%':>6}")
     print(THIN_DIV)
 
     for sk in sorted(SECTION_MAP.keys()):
         for sub in SECTION_MAP[sk]["subsections"]:
-            qs    = by_sub.get(sub, [])
-            total = len(qs)
-            right = sum(q["right"] for q in qs)
-            wrong = sum(q["wrong"] for q in qs)
-            asked = right + wrong
-            pct   = f"{right/asked*100:.0f}%" if asked > 0 else "—"
-            name  = SECTION_MAP[sk]["sub_names"].get(sub, "")
-            print(f"  {sub:<8} {name:<42} {total:>4} {right:>5} {wrong:>5} {pct:>6}")
+            qs       = by_sub.get(sub, [])
+            total    = len(qs)
+            right    = sum(q["right"] for q in qs)
+            wrong    = sum(q["wrong"] for q in qs)
+            lucky    = sum(q.get("lucky", 0) for q in qs)
+            conf_sum = sum(q.get("conf_sum", 0) for q in qs)
+            asked    = right + wrong
+            pct      = f"{right/asked*100:.0f}%" if asked > 0 else "—"
+            real_r   = max(0, right - lucky)
+            conf_disp = f"{conf_sum/real_r+1:.1f}" if (real_r > 0 and conf_sum > 0) else ("—" if real_r == 0 else "3.0")
+            name     = SECTION_MAP[sk]["sub_names"].get(sub, "")
+            print(f"  {sub:<8} {name:<38} {total:>4} {right:>5} {wrong:>5} {lucky:>5} {conf_disp:>5} {pct:>6}")
 
     print(THIN_DIV)
-    total_q = len(all_questions)
-    total_r = sum(q["right"] for q in all_questions)
-    total_w = sum(q["wrong"] for q in all_questions)
-    asked   = total_r + total_w
-    pct_all = f"{total_r/asked*100:.0f}%" if asked > 0 else "—"
-    print(f"  {'TOTAL':<8} {'':<42} {total_q:>4} {total_r:>5} {total_w:>5} {pct_all:>6}")
+    total_q  = len(all_questions)
+    total_r  = sum(q["right"] for q in all_questions)
+    total_w  = sum(q["wrong"] for q in all_questions)
+    total_l  = sum(q.get("lucky", 0) for q in all_questions)
+    total_cs = sum(q.get("conf_sum", 0) for q in all_questions)
+    asked    = total_r + total_w
+    pct_all  = f"{total_r/asked*100:.0f}%" if asked > 0 else "—"
+    real_r_all = max(0, total_r - total_l)
+    conf_all   = f"{total_cs/real_r_all+1:.1f}" if (real_r_all > 0 and total_cs > 0) else ("—" if real_r_all == 0 else "3.0")
+    print(f"  {'TOTAL':<8} {'':<38} {total_q:>4} {total_r:>5} {total_w:>5} {total_l:>5} {conf_all:>5} {pct_all:>6}")
     print(DIVIDER)
 
 # ---------------------------------------------------------------------------
@@ -365,6 +421,10 @@ def reset_data() -> None:
             row[7].value = 0   # # Of times asked
             row[8].value = 0   # RIGHT
             row[9].value = 0   # WRONG
+            if len(row) > 11:
+                row[11].value = 0  # LUCKY
+            if len(row) > 12:
+                row[12].value = 0  # CONF_SUM
         wb.save(EXCEL_PATH)
         wb.close()
         print("  Excel stats cleared.")
@@ -632,7 +692,7 @@ def _wrap(text: str, width: int = 60, indent: str = "  ") -> list:
     return lines
 
 
-def run_quiz(questions: list, bookmarks: set = None) -> tuple:
+def run_quiz(questions: list, bookmarks: set = None, exam_mode: bool = False) -> tuple:
     """
     Run the quiz loop.
     Returns (correct_count, total, section_results, missed_questions, elapsed_seconds).
@@ -645,6 +705,7 @@ def run_quiz(questions: list, bookmarks: set = None) -> tuple:
     section_results  = {}
     missed_questions = []
     session_start    = time.time()
+    last_answered    = 0
 
     for i, q in enumerate(questions, 1):
         print(f"\n{DIVIDER}")
@@ -669,19 +730,25 @@ def run_quiz(questions: list, bookmarks: set = None) -> tuple:
         correct_text   = q["choices"][correct_letter]
 
         # --- Get answer ---
-        answer  = None
-        was_idk = False
+        answer   = None
+        was_idk  = False
+        end_exam = False
+        if exam_mode:
+            ans_prompt = "  Your answer (1–4, IDK=skip, B=bookmark, C=copy, END TEST=end, H=help, Q=quit): "
+        else:
+            ans_prompt = "  Your answer (1–4, IDK=skip, C=copy, H=help, Q=quit): "
         while answer is None:
-            raw = _input("  Your answer (1–4, IDK=skip, C=copy, B=bookmark, H=help, Q=quit): ")
+            raw = _input(ans_prompt)
             if raw == "Q":
                 print("\n  Returning to main menu...")
-                return correct_count, i - 1, section_results, missed_questions, time.time() - session_start
+                return correct_count, last_answered, section_results, missed_questions, time.time() - session_start
+            if exam_mode and raw in ("END", "END TEST"):
+                end_exam = True
+                break
             if raw == "IDK":
                 answer  = "IDK"
                 was_idk = True
-            elif raw == "C":
-                _copy_to_clipboard(q)
-            elif raw == "B":
+            elif raw == "B" and exam_mode:
                 if bookmarks is not None:
                     if q["row"] in bookmarks:
                         bookmarks.discard(q["row"])
@@ -692,34 +759,68 @@ def run_quiz(questions: list, bookmarks: set = None) -> tuple:
                         save_bookmarks(bookmarks)
                         print("  Bookmarked!")
                 else:
-                    print("  (Bookmarks not available in this session.)")
+                    print("  (Bookmarks not available.)")
+            elif raw == "C":
+                _copy_to_clipboard(q)
             elif raw in ("1", "2", "3", "4"):
                 answer = raw
             elif raw not in ("H", "?"):
-                print("  Invalid — enter 1–4, IDK, C, B, H, or Q.")
+                if exam_mode:
+                    print("  Invalid — enter 1–4, IDK, B, C, END TEST, H, or Q.")
+                else:
+                    print("  Invalid — enter 1–4, IDK, C, H, or Q.")
+
+        if end_exam:
+            break
 
         # --- Evaluate answer ---
         if was_idk:
             is_correct = False
-            print(f"\n  Skipped — correct answer:  {correct_text}")
+            if not exam_mode:
+                print(f"\n  Skipped — correct answer:  {correct_text}")
         else:
             chosen_letter = mapping[answer]
             is_correct    = (chosen_letter == correct_letter)
             if is_correct:
                 correct_count += 1
-                print(f"\n  CORRECT!  {correct_text}")
+                if not exam_mode:
+                    print(f"\n  CORRECT!  {correct_text}")
             else:
-                chosen_text = q["choices"][chosen_letter]
-                print(f"\n  INCORRECT.  You chose:     {chosen_text}")
-                print(f"  Correct answer:  {correct_text}")
+                if not exam_mode:
+                    chosen_text = q["choices"][chosen_letter]
+                    print(f"\n  INCORRECT.  You chose:     {chosen_text}")
+                    print(f"  Correct answer:  {correct_text}")
 
         # Show explanation if available (wrong / IDK only)
-        if not is_correct and q.get("explanation"):
+        if not exam_mode and not is_correct and q.get("explanation"):
             print(f"\n  WHY: {q['explanation']}")
 
-        # --- Confidence rating ---
-        conf_raw = input("  Confidence? (1=guessed  2=unsure  3=sure  Enter=skip): ").strip()
-        confidence = int(conf_raw) if conf_raw in ("1", "2", "3") else None
+        # --- Confidence + Bookmark (correct answers only, not in exam mode) ---
+        confidence = None
+        if is_correct and not exam_mode:
+            print("  Confidence?  1 guessed · 2 unsure · 3 kinda sure · 4 sure · Enter skip")
+            print("               Add ,B to bookmark at same time  (e.g. 3,B  or  B,2)")
+            while True:
+                conf_raw = input("  > ").strip().upper()
+                tokens = [t.strip() for t in conf_raw.split(",") if t.strip()]
+                if not all(t in ("1", "2", "3", "4", "B") for t in tokens):
+                    print("  Invalid — use 1–4, B, or combine like 3,B")
+                    continue
+                rating_tok = next((t for t in tokens if t in ("1", "2", "3", "4")), None)
+                if "B" in tokens:
+                    if bookmarks is not None:
+                        if q["row"] in bookmarks:
+                            bookmarks.discard(q["row"])
+                            save_bookmarks(bookmarks)
+                            print("  Bookmark removed.")
+                        else:
+                            bookmarks.add(q["row"])
+                            save_bookmarks(bookmarks)
+                            print("  Bookmarked!")
+                    else:
+                        print("  (Bookmarks not available.)")
+                confidence = int(rating_tok) if rating_tok else None
+                break
 
         # Track missed: wrong, IDK, or correct-but-guessed (lucky guess)
         was_lucky = is_correct and confidence == 1
@@ -746,10 +847,12 @@ def run_quiz(questions: list, bookmarks: set = None) -> tuple:
             section_results[sec_key][0] += 1
 
         # Save to Excel
-        save_result(q["row"], is_correct)
+        conf_pts = {1: 0, 2: 1, 3: 2, 4: 3}.get(confidence, 2) if (is_correct and not was_idk) else 0
+        save_result(q["row"], is_correct, lucky=was_lucky, conf_pts=conf_pts)
+        last_answered = i
         print(THIN_DIV)
 
-    return correct_count, total, section_results, missed_questions, time.time() - session_start
+    return correct_count, last_answered, section_results, missed_questions, time.time() - session_start
 
 
 def show_score(correct: int, total: int,
@@ -870,6 +973,118 @@ def show_history() -> None:
 
     print(DIVIDER)
 
+
+def exam_review(questions_shown: list, missed_questions: list, bookmarks: set) -> None:
+    """After a Full Exam: let the user browse bookmarked and IDK questions with answers revealed."""
+    idk_rows = {mq["row"] for mq in missed_questions if mq.get("was_idk")}
+    bm_rows  = {q["row"] for q in questions_shown if q["row"] in (bookmarks or set())}
+
+    review_list = []
+    for q in questions_shown:
+        is_bm  = q["row"] in bm_rows
+        is_idk = q["row"] in idk_rows
+        if is_bm or is_idk:
+            review_list.append((is_bm, is_idk, q))
+
+    if not review_list:
+        return
+
+    bm_count  = sum(1 for bm, _,  __ in review_list if bm)
+    idk_count = sum(1 for  _, idk, __ in review_list if idk)
+
+    print(f"\n{DIVIDER}")
+    print("  EXAM REVIEW — BOOKMARKED & IDK QUESTIONS")
+    print(DIVIDER)
+    if bm_count:
+        print(f"  [B]  Bookmarked:    {bm_count} question(s)")
+    if idk_count:
+        print(f"  [I]  IDK (skipped): {idk_count} question(s)")
+    print()
+
+    for i, (is_bm, is_idk, q) in enumerate(review_list, 1):
+        tag     = "[BI]" if (is_bm and is_idk) else "[B] " if is_bm else "[I] "
+        preview = (q["question"][:52] + "...") if len(q["question"]) > 52 else q["question"]
+        print(f"  {tag} {i:2}.  Sec {q['section']}  {preview}")
+
+    print(THIN_DIV)
+    raw = input("  Review which? (e.g. 1,3  or  ALL  or Enter to skip): ").strip().upper()
+
+    if not raw:
+        return
+
+    if raw == "ALL":
+        indices = list(range(len(review_list)))
+    else:
+        indices = []
+        for part in raw.split(","):
+            try:
+                idx = int(part.strip()) - 1
+                if 0 <= idx < len(review_list):
+                    indices.append(idx)
+            except ValueError:
+                pass
+        if not indices:
+            print("  No valid question numbers entered — skipping review.")
+            return
+
+    review_correct = 0
+    for n, idx in enumerate(indices, 1):
+        is_bm, is_idk, q = review_list[idx]
+        tag_label = ("BOOKMARKED" + (" | IDK" if is_idk else "")) if is_bm else "IDK"
+
+        print(f"\n{DIVIDER}")
+        print(f"  Review {n}/{len(indices)}   Section {q['section']}   {tag_label}")
+        print(DIVIDER)
+
+        for ln in _wrap(q["question"]):
+            print(ln)
+        print()
+
+        # Shuffle choices just like the real exam
+        letters = ["A", "B", "C", "D"]
+        random.shuffle(letters)
+        mapping = {str(num): letter for num, letter in enumerate(letters, 1)}
+
+        for num, letter in mapping.items():
+            print(f"    {num}. {q['choices'][letter]}")
+        print()
+
+        correct_letter = q["correct"]
+        correct_text   = q["choices"][correct_letter]
+
+        answer = None
+        while answer is None:
+            raw = input("  Your answer (1–4, Enter=reveal): ").strip().upper()
+            if raw in ("1", "2", "3", "4"):
+                answer = raw
+            elif raw == "":
+                answer = "REVEAL"
+            else:
+                print("  Invalid — enter 1–4 or press Enter to reveal.")
+
+        if answer == "REVEAL":
+            print(f"\n  Answer: {correct_text}")
+            save_result(q["row"], correct=False, conf_pts=0)
+        else:
+            chosen_letter = mapping[answer]
+            is_correct    = (chosen_letter == correct_letter)
+            if is_correct:
+                review_correct += 1
+                print(f"\n  CORRECT!  {correct_text}")
+                save_result(q["row"], correct=True, conf_pts=2)
+            else:
+                print(f"\n  INCORRECT.  You chose: {q['choices'][chosen_letter]}")
+                print(f"  Correct answer:        {correct_text}")
+                save_result(q["row"], correct=False, conf_pts=0)
+
+        if q.get("explanation"):
+            print(f"\n  WHY: {q['explanation']}")
+
+        print(THIN_DIV)
+
+    print(f"\n  Review complete.  {review_correct}/{len(indices)} correct on re-attempt.")
+    print(DIVIDER)
+
 # ---------------------------------------------------------------------------
 # Session log helpers
 # ---------------------------------------------------------------------------
@@ -931,10 +1146,11 @@ def main() -> None:
                     print("  No questions available for Full Exam Mode. Add questions and re-run.")
                     continue
                 print(f"  {len(questions)} questions loaded. Good luck!\n")
-                correct, total_q, section_results, missed, elapsed = run_quiz(questions, bookmarks)
+                correct, total_q, section_results, missed, elapsed = run_quiz(questions, bookmarks, exam_mode=True)
                 show_score(correct, total_q, section_results, exam_mode=True,
                            missed_questions=missed, elapsed=elapsed)
                 append_session_log("Full Exam", "All", 75, correct, total_q)
+                exam_review(questions[:total_q], missed, bookmarks)
 
             # --- Bookmarks Mode ---
             elif mode == "B":
